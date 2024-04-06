@@ -1,0 +1,21 @@
+# global options
+{
+    # Turn on/off debugging.
+    #debug
+
+    # Disable the automatic management of TLS certs with Let's Encrypt
+    # https://caddyserver.com/docs/caddyfile/options#auto-https
+    # Remove this if you wish to have Caddy manage TLS for you.
+    auto_https disable_certs
+}
+
+
+my.domain.com {
+    # Specify path to TLS certificates. Remove this is you wish for caddy to manage TLS for you.
+    tls /ssl/fullchain.pem /ssl/privkey.pem
+
+    root * /var/www/site/public
+    encode gzip
+    php_fastcgi 127.0.0.1:9000
+    file_server
+}
