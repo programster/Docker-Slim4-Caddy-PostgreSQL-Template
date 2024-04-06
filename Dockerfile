@@ -1,96 +1,87 @@
-# Due to layout of this project, the dockerfile will be moved up two directories and run during
-# the build. Thus when performing any ADD commands, remember that this is "where you are"
+FROM debian:12
 
-FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteract
 
-# Upgrade and install ondrej PPA
-RUN apt-get update && apt-get dist-upgrade -y \
-    && apt-get install -y software-properties-common apt-transport-https \
-    && add-apt-repository ppa:ondrej/php -y
+
+RUN apt-get update && apt-get dist-upgrade -y
+
+
+# Expose port 80/443 for the web requests
+EXPOSE 80
+EXPOSE 443
+
 
 # Install the relevant packages
-# ghostscript required for merging pdf files together for memory limits.
-RUN apt-get update && apt-get install ghostscript vim apache2 curl libapache2-mod-php8.2 \
-    php8.2-cli php8.2-xml php8.2-mbstring php8.2-curl  \
+RUN apt-get update && apt-get install vim curl php-fpm git unzip supervisor cron composer \
+    php8.2-cli php8.2-xml php8.2-mbstring php8.2-curl php8.2-bcmath  \
     php8.2-pgsql php8.2-zip php8.2-gd -y
 
-# Remove any  php7.* stuff to prevent composer getting confused.
-RUN apt-get remove php7.* -y && apt-get autoremove -y
 
-# Install composer
-RUN apt-get update \
-  && apt-get install curl -y \
-  && curl -sS https://getcomposer.org/installer | php \
-  && mv composer.phar /usr/bin/composer \
-  && chmod +x /usr/bin/composer
+# Install caddy webserver
+RUN apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl -y \
+  && curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg \
+  && curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list \
+  && apt-get update \
+  && apt-get install caddy -y
 
-# Enable the php mod we just installed
-RUN a2enmod php8.2 && a2enmod rewrite
 
-# Expose port 80 for the web requests
-EXPOSE 80
+# increase security by configuring php-fpm to only execute exact matches for files,
+# rather than executing the closest matching file.
+ENV SEARCH=";cgi.fix_pathinfo=.*"
+ENV REPLACE="cgi.fix_pathinfo=1"
+ENV FILEPATH="/etc/php/8.2/fpm/php.ini"
+RUN sed -i "s|$SEARCH|$REPLACE|" $FILEPATH
 
-# Manually set the apache environment variables in order to get apache to work immediately.
-ENV APACHE_RUN_USER www-data
-ENV APACHE_RUN_GROUP www-data
-ENV APACHE_LOG_DIR /var/log/apache2
-ENV APACHE_RUN_DIR=/var/run/apache2
 
-# It appears that the new apache requires these env vars as well
-ENV APACHE_LOCK_DIR /var/lock/apache2
-ENV APACHE_PID_FILE /var/run/apache2/apache2.pid
+# Set display errors to on, we can decide in the application layer whether to hide or not based on the environment.
+ENV SEARCH="display_errors = Off"
+ENV REPLACE="display_errors = On"
+ENV FILEPATH="/etc/php/8.2/fpm/php.ini"
+RUN sed -i "s|$SEARCH|$REPLACE|" $FILEPATH
 
-# Turn on display errors. We will disable them based on environment. Also bump up limits like the maximum
-# upload size and memory limits, as we want to allow admins to upload massive hoard files and download large
-# generated PDFs.
-RUN sed -i 's;display_errors = .*;display_errors = On;' /etc/php/8.2/apache2/php.ini && \
-    sed -i 's;post_max_size = .*;post_max_size = 100M;' /etc/php/8.2/apache2/php.ini && \
-    sed -i 's;upload_max_filesize = .*;upload_max_filesize = 100M;' /etc/php/8.2/apache2/php.ini
-
-# Install the cron service to tie up the container's foreground process
-RUN apt-get install cron -y
 
 # Add the site's code to the container.
 # When in development, use a volume to overwrite this area.
 COPY --chown=root:www-data site /var/www/site
 
+
 # Install PHP packages
-RUN cd /var/www/site \
-  && composer install \
-  && chown --recursive root:www-data /var/www/site/vendor \
-  && chmod 750 -R /var/www/site/vendor
+RUN chmod 750 --recursive /var/www/site \
+    && cd /var/www/site \
+    && composer install \
+    && chown --recursive root:www-data /var/www/site/vendor \
+    && chmod 750 --recursive /var/www/site/vendor
 
 
-# Update our apache sites available with the config we created
-ADD docker/apache-config.conf /etc/apache2/sites-enabled/000-default.conf
+# Add our Caddyfile configuration.
+ADD docker/Caddyfile /etc/caddy/Caddyfile
 
-# Uncomment these if you are having your container handle SSL rather than using
-# a reverse proxy like traefik
-#EXPOSE 443
-#VOLUME /etc/apache2/ssl
-#RUN a2enmod ssl
-#ADD docker/apache-ssl-config.conf /etc/apache2/sites-available/default-ssl.conf
-#RUN a2ensite default-ssl
+
+# Replace the php-fpm pool config so that we listen on TCP port 9000 instead of using a local
+# unix socket. Also set static number of processes which container will set according to CPU count on startup (see
+# startup.sh)
+# https://serverfault.com/questions/884468/nginx-with-php-fpm-resource-temporarily-unavailable-502-error/884477#884477
+ADD docker/php-fpm-pool.conf /etc/php/8.2/fpm/pool.d/www.conf
+
 
 # Use the crontab file.
 # The crontab file was already added when we added "project"
 ADD docker/crons.conf /root/crons.conf
 RUN crontab /root/crons.conf && rm /root/crons.conf
 
-# Set permissions
-RUN chown root:www-data /var/www
-RUN chmod 750 -R /var/www
 
 # Copy the script across that will create the .env file on startup for the web user to use.
 COPY docker/create-env-file.php /root/create-env-file.php
 
+
 # Add the startup script to the container
 COPY docker/startup.sh /root/startup.sh
 
+
 # Change the workdir to /var/www/site so that when devs enter the container, they are at the site
 WORKDIR /var/www/site
+
 
 # Execute the containers startup script which will start many processes/services
 # The startup file was already added when we added "project"
